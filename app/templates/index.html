@@ -49,6 +49,17 @@
   .chk-ok { color:var(--ok); }
   .muted { color:#57606a; font-size:12px; }
   .frozen { font-size:12px; color:#57606a; margin-bottom:8px; }
+  .divider { border:none; border-top:2px solid #0b2a4a; margin:22px 0 6px; }
+  .tgrid { display:grid; gap:10px; margin-bottom:12px; }
+  .tcol { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:#fafbfc; }
+  .tcol h4 { margin:0 0 6px; font-size:13px; word-break:break-all; }
+  .role { font:11px ui-monospace,Menlo,Consolas,monospace; margin:3px 0; }
+  .role .rlabel { color:#57606a; display:inline-block; min-width:64px; }
+  .shared-yes { color:var(--ok); font-weight:700; }
+  .shared-no { color:#57606a; }
+  .pill { display:inline-block; padding:0 6px; margin:1px; border-radius:4px; background:#eaf2ff; font-size:11px; }
+  .pill.ce { background:#dff0e0; } .pill.nc { background:#e8f0fe; } .pill.wc { background:#f3e8fd; }
+  .unused td { color:#777; }
 </style>
 </head>
 <body>
@@ -83,11 +94,34 @@
       <button type="button" onclick="reopen()">读取</button>
     </div>
     <p class="muted" id="rawlink"></p>
+
+    <hr class="divider">
+    <h2>多目标共同记录证据包</h2>
+    <p class="muted">打开一份<b>已通过</b>的冻结审计后，输入稳定证据包标识与 2–6 个同区规范目标名称；服务从来源审计冻结的完整记录组中逐目标重算并抽出最优共同记录子集，不改写原审计。</p>
+    <label>证据包标识 package_id</label>
+    <input type="text" id="pkg_id" placeholder="如 SAT-PKG-20261001-001">
+    <label>来源审计标识（须为已通过的冻结审计）</label>
+    <input type="text" id="pkg_source" placeholder="如 SAT-NSEC3-20260929-001">
+    <label>目标名称（每行一个，2–6 个，同区、不可重复）</label>
+    <textarea id="pkg_targets" rows="3" placeholder="host-a.offline.example.cn&#10;host-b.offline.example.cn"></textarea>
+    <div class="btns">
+      <button type="button" class="primary" onclick="submitPackage()">冻结共同记录证据包</button>
+    </div>
+    <h2 style="margin-top:14px">按包标识重开冻结结论</h2>
+    <div style="display:flex;gap:8px">
+      <input type="text" id="repkg_id" placeholder="输入已冻结的 package_id">
+      <button type="button" onclick="reopenPackage()">读取</button>
+    </div>
   </section>
 
   <section class="card" id="result">
     <h2>审计结论与逐项证据</h2>
     <p class="muted">提交后或按标识读取后，此处并列展示最近存在祖先、两项被覆盖名称、所用记录及环绕方向，供复算。</p>
+  </section>
+
+  <section class="card" id="pkg_result" style="grid-column:1 / -1;">
+    <h2>共同记录证据包结论</h2>
+    <p class="muted">冻结后或按包标识读取后，此处并列展示每个目标的三项证明角色、共享记录归属与未被选用记录。</p>
   </section>
 </main>
 
@@ -215,7 +249,7 @@ function render(r, meta){
   // 记录组与覆盖标记
   box.appendChild(el("h3",null,"所用 NSEC3 记录（环形半开区间 [owner, next) 判定）"));
   const t=el("table"); const thead=el("thead"); const trh=el("tr");
-  ["记录","owner 哈希","next 哈希","类型位图","环绕方向","覆盖 NC","覆盖 *.CE"].forEach(h=>trh.appendChild(el("th",null,h)));
+  ["记录","owner 哈希","next 哈希","类型位图","环绕方向","佐证 CE","覆盖 NC","覆盖 *.CE"].forEach(h=>trh.appendChild(el("th",null,h)));
   thead.appendChild(trh); t.appendChild(thead);
   const tb=el("tbody");
   (r.records||[]).forEach(x=>{
@@ -226,6 +260,7 @@ function render(r, meta){
     tr.appendChild(el("td",null,(x.types||[]).join(" ")));
     const w=el("td"); const tag=el("span","tag "+(x.wrap_direction==="wrap"?"wrap":"nowrap"));
     tag.textContent=x.wrap_direction==="wrap"?"wrap 环绕":"no-wrap"; w.appendChild(tag); tr.appendChild(w);
+    tr.appendChild(el("td",x.covers_closest_encloser?"ok":"no",x.covers_closest_encloser?"是":""));
     tr.appendChild(el("td",x.covers_next_closer?"ok":"no",x.covers_next_closer?"是":"否"));
     tr.appendChild(el("td",x.covers_wildcard?"ok":"no",x.covers_wildcard?"是":"否"));
     tb.appendChild(tr);
@@ -258,6 +293,172 @@ function render(r, meta){
 }
 
 addRec(); addRec(); addRec();
+
+// ── 多目标共同记录证据包 ──────────────────────────────────────
+const PKG_API = "/api/packages";
+const ROLE_TEXT = {ce:"① CE 最近存在祖先", nc:"② NC 下一层覆盖", wc:"③ 通配符 *.CE 覆盖"};
+
+function collectPackage(){
+  const targets = document.getElementById("pkg_targets").value
+    .split(/\n+/).map(s=>s.trim()).filter(Boolean);
+  return {
+    package_id: document.getElementById("pkg_id").value.trim(),
+    source_audit_id: document.getElementById("pkg_source").value.trim(),
+    targets
+  };
+}
+
+async function submitPackage(){
+  const p = collectPackage();
+  if(!p.package_id){ alert("请输入证据包标识"); return; }
+  if(!p.source_audit_id){ alert("请输入来源审计标识"); return; }
+  if(p.targets.length<2){ alert("至少输入 2 个目标名称（每行一个）"); return; }
+  const r = await fetch(PKG_API,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(p)});
+  const data = await r.json();
+  if(data.reuse){ renderPackageReuse(data); return; }
+  renderPackage(data.result, data);
+}
+
+async function reopenPackage(){
+  const id = document.getElementById("repkg_id").value.trim();
+  if(!id){ alert("请输入证据包标识"); return; }
+  const r = await fetch(PKG_API+"?id="+encodeURIComponent(id));
+  const data = await r.json();
+  if(!data.found){ renderPackageError("未找到证据包标识 "+id+" 的冻结结论"); return; }
+  document.getElementById("pkg_id").value = data.result.package_id || "";
+  document.getElementById("pkg_source").value = data.result.source_audit_id || "";
+  document.getElementById("pkg_targets").value = (data.result.targets||[]).join("\n");
+  renderPackage(data.result, data);
+}
+
+function renderPackageReuse(d){
+  const box=document.getElementById("pkg_result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"共同记录证据包结论"));
+  box.appendChild(el("div","banner rejected","拒绝：证据包标识复用但改换了来源或目标 —— 原冻结结论保持不变，不给予通过"));
+  box.appendChild(el("p",null,d.message||""));
+}
+function renderPackageError(msg){
+  const box=document.getElementById("pkg_result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"共同记录证据包结论"));
+  box.appendChild(el("div","banner rejected",msg));
+}
+
+function renderPackage(r, meta){
+  const box=document.getElementById("pkg_result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"共同记录证据包结论"));
+  if(meta){
+    const f=el("div","frozen");
+    const who = meta.status==="unchanged" ? "（同标识同载荷：返回既有冻结结论）"
+              : meta.status==="frozen" ? "（已冻结）" : "（已冻结结论）";
+    f.textContent = `package_id=${r.package_id}  来源审计=${r.source_audit_id}  冻结时间=${meta.frozen_at||""}  载荷指纹=${(meta.fingerprint||"").slice(0,20)}… ${who}`;
+    box.appendChild(f);
+  }
+  const banner=el("div","banner "+r.verdict);
+  banner.textContent = r.verdict==="passed"
+    ? `通过：${r.selected_count} 条共同记录同时证明全部 ${r.targets.length} 个目标不存在`
+    : "拒绝：无法从来源记录组抽出使全部目标同时通过的共同记录子集";
+  box.appendChild(banner);
+
+  const src=el("div","grid4");
+  src.appendChild(kv("来源审计（冻结快照，不改写）", r.source_audit_id,
+      `指纹 ${(r.source_fingerprint||"").slice(0,24)}…`,
+      `来源完整记录组 ${r.total_source_records} 条随证据包一并冻结`));
+  src.appendChild(kv("冻结 NSEC3 参数", `zone=${r.zone}`, "",
+      `salt=${r.salt} iter=${r.iterations} alg=${r.algorithm}`));
+  src.appendChild(kv("最优共同记录子集", `${r.selected_count} 条`, "",
+      `各目标单条证明简单拼接合计 ${r.stitched_single_proof_count} 条；共享后减少 `+
+      `${r.stitched_single_proof_count-r.selected_count} 条`));
+  const st=r.candidate_stats||{};
+  src.appendChild(kv("候选枚举与裁决", `复算候选 ${st.evaluated||0} 个 / 全目标通过 ${st.feasible||0} 个`,
+      "", "先最少化记录数，同规模再按 owner 哈希升序序列稳定裁决；每个候选逐目标重算 CE/NC/通配符"));
+  box.appendChild(src);
+
+  // 并列：每个目标的三项证明角色
+  box.appendChild(el("h3",null,"各目标三项证明角色（并列）"));
+  const tg=el("div","tgrid");
+  tg.style.gridTemplateColumns = `repeat(auto-fit, minmax(280px, 1fr))`;
+  (r.targets_detail||[]).forEach(d=>{
+    const c=el("div","tcol");
+    const h=el("h4"); h.appendChild(el("span",d.passed?"tag-ok":"tag-no", d.passed?"✔ ":"✘ "));
+    h.appendChild(el("span",null,d.target)); c.appendChild(h);
+    const ce=d.closest_encloser||{};
+    const line1=el("div","role");
+    line1.appendChild(el("span","rlabel","① CE"));
+    line1.appendChild(el("span",null,`${ce.name||"（无）"} `));
+    line1.appendChild(el("span","pill ce",ce.record_ref||"-"));
+    c.appendChild(line1);
+    const nc=d.next_closer||{};
+    const line2=el("div","role");
+    line2.appendChild(el("span","rlabel","② NC"));
+    line2.appendChild(el("span",null,`${nc.name||"（不适用）"} `));
+    (nc.record_refs||[]).forEach(x=>line2.appendChild(el("span","pill nc",x)));
+    c.appendChild(line2);
+    const wc=d.wildcard||{};
+    const line3=el("div","role");
+    line3.appendChild(el("span","rlabel","③ *.CE"));
+    line3.appendChild(el("span",null,`${wc.name||"（无）"} `));
+    (wc.record_refs||[]).forEach(x=>line3.appendChild(el("span","pill wc",x)));
+    c.appendChild(line3);
+    const det=el("details");
+    det.appendChild(el("summary",null,"祖先哈希复算与逐项检查"));
+    (d.ancestors||[]).forEach(a=>det.appendChild(el("div","muted",
+        `${a.owner_exists?"●":"○"} ${a.name}  ${a.hash}`)));
+    (d.checks||[]).forEach(chk=>det.appendChild(el("div",chk.ok?"chk-ok":"chk-no",chk.name+"："+chk.detail)));
+    c.appendChild(det);
+    tg.appendChild(c);
+  });
+  box.appendChild(tg);
+
+  // 选用记录与共享归属
+  box.appendChild(el("h3",null,`选用的共同记录（${r.selected_count} 条，按 owner 哈希升序）`));
+  const t=el("table"); const thr=el("tr");
+  ["记录","owner 哈希","next 哈希","类型位图","环绕","共享归属（目标:角色）"].forEach(h=>thr.appendChild(el("th",null,h)));
+  t.appendChild(thr);
+  (r.selected||[]).forEach(x=>{
+    const tr=el("tr");
+    tr.appendChild(el("td",null,x.ref));
+    tr.appendChild(el("td",null,x.owner_hash));
+    tr.appendChild(el("td",null,x.next_hash));
+    tr.appendChild(el("td",null,(x.types||[]).join(" ")));
+    const w=el("td"); const tag=el("span","tag "+(x.wrap_direction==="wrap"?"wrap":"nowrap"));
+    tag.textContent=x.wrap_direction==="wrap"?"wrap":"no-wrap"; w.appendChild(tag); tr.appendChild(w);
+    const sv=el("td");
+    sv.appendChild(el("span",x.shared?"shared-yes":"shared-no",
+        x.shared?`共享于 ${x.serves.length} 个目标 `:"仅 1 个目标 "));
+    (x.serves||[]).forEach(s=>{
+      const pill=el("span","pill", s.target+" ["+s.roles.map(z=>({ce:"CE",nc:"NC",wc:"WC"}[z])).join(",")+"]");
+      sv.appendChild(pill);
+    });
+    tr.appendChild(sv);
+    t.appendChild(tr);
+  });
+  box.appendChild(t);
+
+  // 未被选用记录
+  box.appendChild(el("h3",null,`未被选用的来源记录（${(r.unused||[]).length} 条）`));
+  const tu=el("table"); const trhu=el("tr");
+  ["记录","owner 哈希","next 哈希","类型位图","环绕方向"].forEach(h=>trhu.appendChild(el("th",null,h)));
+  tu.appendChild(trhu);
+  (r.unused||[]).forEach(x=>{
+    const tr=el("tr","unused");
+    tr.appendChild(el("td",null,x.ref));
+    tr.appendChild(el("td",null,x.owner_hash));
+    tr.appendChild(el("td",null,x.next_hash));
+    tr.appendChild(el("td",null,(x.types||[]).join(" ")));
+    tr.appendChild(el("td",null,x.wrap_direction==="wrap"?"wrap":"no-wrap"));
+    tu.appendChild(tr);
+  });
+  box.appendChild(tu);
+
+  const dc=el("details"); dc.open=true; dc.appendChild(el("summary",null,"逐项检查"));
+  (r.checks||[]).forEach(c=>dc.appendChild(el("div",c.ok?"chk-ok":"chk-no",c.name+"："+c.detail)));
+  box.appendChild(dc);
+  if((r.errors||[]).length){
+    const de=el("details"); de.open=true; de.appendChild(el("summary",null,"拒绝原因（"+r.errors.length+"）"));
+    r.errors.forEach(e=>de.appendChild(el("div","err","["+e.code+"] "+e.message)));
+    box.appendChild(de);
+  }
+}
 </script>
 </body>
 </html>

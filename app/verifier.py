@@ -8,11 +8,15 @@
   3. 通配符名 *.CE：其哈希同样必须被一条（无 Opt-Out 的）NSEC3 区间覆盖，
      以排除通配符展开。
 三者缺一即证据不足，任何非法/冲突输入一律 rejected。
+
+本模块同时为多目标“共同记录证据包”（见 app/packages.py）提供可复用的纯
+函数：输入归一化、记录解析与单目标评估，证据包引擎对每个候选子集逐目标
+重新调用 evaluate_target，而不是拼接各目标的既有结论。
 """
 
 from __future__ import annotations
 
-import time
+import re
 from dataclasses import dataclass, field
 
 from .nsec3 import (
@@ -26,7 +30,6 @@ from .nsec3 import (
     nsec3_hash,
     parse_type_bitmap,
 )
-import re
 
 PASS = "passed"
 REJECT = "rejected"
@@ -40,6 +43,7 @@ class Record:
     types: list[str]
     opt_out: bool = False
     wrap: bool = False
+    covers_ce: bool = False
     covers_nc: bool = False
     covers_wc: bool = False
     raw_owner: str = ""
@@ -58,6 +62,28 @@ class _Ctx:
         self.checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
 
+@dataclass
+class TargetEvaluation:
+    """单目标在某一候选记录子集上的完整复算结果。"""
+
+    target: str
+    ancestors: list[dict]
+    closest_encloser: dict | None
+    next_closer: dict | None
+    wildcard: dict | None
+    # ref -> {"ce": bool, "nc": bool, "wc": bool, "wrap": bool}
+    roles: dict[str, dict]
+    checks: list[dict]
+    errors: list[dict]
+
+    @property
+    def passed(self) -> bool:
+        return not self.errors
+
+    def error_codes(self) -> set[str]:
+        return {e["code"] for e in self.errors}
+
+
 def _h2int(b32: str) -> int:
     return int.from_bytes(b32hex_decode(b32), "big")
 
@@ -72,7 +98,13 @@ def ring_interval(owner: int, nxt: int, h: int) -> tuple[bool, bool]:
     return owner < h < nxt, False
 
 
-def _parse_records(raw_records, ctx: _Ctx) -> list[Record]:
+def parse_records(raw_records, ctx: _Ctx) -> list[Record]:
+    """解析并校验记录组：非法哈希/位图、Opt-Out、重复 owner、退化区间等。
+
+    注意：记录的“证据角色”（covers_nc/covers_wc/wrap）不在此处标定，
+    因为同一记录组对不同目标、不同候选子集的角色不同，须由
+    evaluate_target 逐目标重新计算。
+    """
     if not isinstance(raw_records, list) or not raw_records:
         ctx.fail("NO_RECORDS", "记录组为空：证据不足")
         return []
@@ -145,11 +177,9 @@ def _parse_records(raw_records, ctx: _Ctx) -> list[Record]:
     return records
 
 
-def verify(payload: dict) -> dict:
-    """对一次提交执行审计，返回可冻结的完整结论字典。"""
-    ctx = _Ctx()
+def normalize_inputs(payload: dict, ctx: _Ctx) -> dict:
+    """归一化单目标审计的标识/区域/目标/盐值/迭代次数，错误写入 ctx。"""
     payload = payload or {}
-
     audit_id = str(payload.get("audit_id", "")).strip()
     if not audit_id or len(audit_id) > 128 or any(c.isspace() for c in audit_id):
         ctx.fail("BAD_AUDIT_ID", "审计标识须为非空且不含空白的字符串（≤128 字符）")
@@ -190,35 +220,36 @@ def verify(payload: dict) -> dict:
     if zone and target == zone:
         ctx.fail("TARGET_IS_APEX", "目标即区域顶点，顶点名称必然存在，不可能为 NXDOMAIN")
 
-    records = _parse_records(payload.get("records", []), ctx)
-
-    result: dict = {
+    return {
         "audit_id": audit_id,
         "zone": zone,
         "target": target,
         "salt": salt,
         "iterations": iterations,
-        "algorithm": "SHA-1",
-        "opt_out": False,
-        "verdict": REJECT,
-        "ancestors": [],
-        "closest_encloser": None,
-        "next_closer": None,
-        "wildcard": None,
-        "records": [],
-        "checks": ctx.checks,
-        "errors": ctx.errors,
-        "frozen_at": None,
     }
 
-    # 参数/记录本身有硬错误时，哈希复算已无意义，直接冻结拒绝结论。
-    if not zone or not target or ctx.errors:
-        result["records"] = [_record_public(r) for r in records]
-        return result
 
-    # 精确计算目标及各祖先的迭代哈希
-    chain = ancestor_chain(target, zone)
+def evaluate_target(
+    target: str,
+    zone: str,
+    salt: str,
+    iterations: int,
+    records: list[Record],
+) -> TargetEvaluation:
+    """对单个目标在给定记录子集上重新复算 CE/NC/通配符覆盖。
+
+    不对记录组本身的合法性（非法哈希、重复 owner 等）做检查——调用方须
+    先经 parse_records 校验。本函数是纯函数，供单目标审计与多目标证据包
+    候选子集枚举共用：每次调用都从祖先链哈希开始重算，绝不复用既有结论。
+    """
+    ctx = _Ctx()
     owner_map = {r.owner_hash: r for r in records if r.owner_hash}
+    roles: dict[str, dict] = {
+        r.ref: {"ce": False, "nc": False, "wc": False, "wrap": False}
+        for r in records
+    }
+
+    chain = ancestor_chain(target, zone)
     ancestors_view = []
     ce_name = None
     nc_name = None
@@ -228,7 +259,10 @@ def verify(payload: dict) -> dict:
         ancestors_view.append({"name": name, "hash": h, "owner_exists": exists})
         if exists and ce_name is None:
             ce_name = name  # 最深匹配者即最近存在祖先
-    result["ancestors"] = ancestors_view
+
+    ce_info = None
+    nc_info = None
+    wc_info = None
 
     if ce_name is None:
         ctx.fail(
@@ -243,19 +277,21 @@ def verify(payload: dict) -> dict:
         h_ce = nsec3_hash(ce_name, salt, iterations)
         h_wc_name = "*." + ce_name
         h_wc = nsec3_hash(h_wc_name, salt, iterations)
-        result["closest_encloser"] = {
+        ce_rec = owner_map.get(h_ce)
+        ce_info = {
             "name": ce_name,
             "hash": h_ce,
-            "record_ref": owner_map[h_ce].ref,
+            "record_ref": ce_rec.ref if ce_rec else None,
         }
+        if ce_rec is not None:
+            roles[ce_rec.ref]["ce"] = True
         if h_wc in owner_map:
             ctx.fail(
                 "WILDCARD_EXISTS",
                 f"通配符 {h_wc_name} 的 owner 哈希存在，可能发生通配符展开，不能据此判定 NXDOMAIN",
             )
-        result["wildcard"] = {"name": h_wc_name, "hash": h_wc}
+        wc_info = {"name": h_wc_name, "hash": h_wc}
 
-        nc_info = None
         if nc_name is not None:
             h_nc = nsec3_hash(nc_name, salt, iterations)
             if h_nc in owner_map:
@@ -264,9 +300,8 @@ def verify(payload: dict) -> dict:
                     f"下一层名称 {nc_name} 的 owner 哈希存在，与“不存在”前提矛盾",
                 )
             nc_info = {"name": nc_name, "hash": h_nc}
-            result["next_closer"] = nc_info
 
-        # 逐条判定环形半开区间归属与环绕方向
+        # 逐条判定环形半开区间归属与环绕方向（针对本子集本目标重算）
         nc_covers, wc_covers = [], []
         for r in records:
             if not r.owner_hash or not r.next_hash:
@@ -274,22 +309,22 @@ def verify(payload: dict) -> dict:
             o, n = _h2int(r.owner_hash), _h2int(r.next_hash)
             if nc_info is not None:
                 inside, wrap = ring_interval(o, n, _h2int(nc_info["hash"]))
-                r.covers_nc, r.wrap = inside, wrap
+                roles[r.ref]["wrap"] = wrap
                 if inside:
+                    roles[r.ref]["nc"] = True
                     nc_covers.append(r.ref)
-            if h_wc is not None:
-                inside, wrap = ring_interval(o, n, _h2int(h_wc))
-                if inside:
-                    r.covers_wc = True
-                    wc_covers.append(r.ref)
-                # 同一 owner 的环绕方向唯一；nc 未覆盖时以 wc 计算结果补记
-                if nc_info is None:
-                    r.wrap = wrap
+            inside, wrap = ring_interval(o, n, _h2int(h_wc))
+            if inside:
+                roles[r.ref]["wc"] = True
+                wc_covers.append(r.ref)
+            # 同一 owner 的环绕方向唯一；nc 不适用时以 wc 计算结果补记
+            if nc_info is None:
+                roles[r.ref]["wrap"] = wrap
 
         ctx.check(
             "closest-encloser",
             True,
-            f"最近存在祖先 {ce_name}（{h_ce}）由 {owner_map[h_ce].ref} 佐证",
+            f"最近存在祖先 {ce_name}（{h_ce}）由 {ce_rec.ref if ce_rec else '（缺失）'} 佐证",
         )
         if nc_info is not None:
             ok = bool(nc_covers)
@@ -319,8 +354,32 @@ def verify(payload: dict) -> dict:
                 "无法排除通配符展开，不得判为 NXDOMAIN",
             )
 
-    # 区间一致性：真实 NSEC3 链的半开区间互不重叠，任何其他记录的 owner
-    # 都不应落入本记录区间（否则一条说它不存在、另一条说它存在：断言冲突）。
+    # 浅祖先（含 zone 顶点）若也缺失，证据链同样不完整
+    h_zone = nsec3_hash(zone, salt, iterations)
+    zone_present = any(a["name"] == zone and a["owner_exists"] for a in ancestors_view)
+    ctx.check(
+        "apex-owner",
+        zone_present,
+        f"区域顶点 {zone}（{h_zone}）owner {'已出现' if zone_present else '缺失，证据不足'}",
+    )
+    if not zone_present:
+        ctx.fail("NO_APEX_OWNER", f"记录组缺少区域顶点 {zone} 的 owner 证据")
+
+    return TargetEvaluation(
+        target=target,
+        ancestors=ancestors_view,
+        closest_encloser=ce_info,
+        next_closer=nc_info,
+        wildcard=wc_info,
+        roles=roles,
+        checks=ctx.checks,
+        errors=ctx.errors,
+    )
+
+
+def check_interval_conflicts(records: list[Record], ctx: _Ctx) -> None:
+    """区间一致性：真实 NSEC3 链的半开区间互不重叠，任何其他记录的 owner
+    都不应落入本记录区间（否则一条说它不存在、另一条说它存在：断言冲突）。"""
     valid = [r for r in records if r.owner_hash and r.next_hash]
     for r in valid:
         o, n = _h2int(r.owner_hash), _h2int(r.next_hash)
@@ -335,34 +394,79 @@ def verify(payload: dict) -> dict:
                     "区间与 owner 断言相互冲突",
                 )
 
-    # 浅祖先（含 zone 顶点）若也缺失，证据链同样不完整
-    if zone:
-        h_zone = nsec3_hash(zone, salt, iterations)
-        zone_present = any(a["name"] == zone and a["owner_exists"] for a in ancestors_view)
-        ctx.check(
-            "apex-owner",
-            zone_present,
-            f"区域顶点 {zone}（{h_zone}）owner {'已出现' if zone_present else '缺失，证据不足'}",
-        )
-        if not zone_present:
-            ctx.fail("NO_APEX_OWNER", f"记录组缺少区域顶点 {zone} 的 owner 证据")
+
+def verify(payload: dict) -> dict:
+    """对一次提交执行审计，返回可冻结的完整结论字典。"""
+    ctx = _Ctx()
+    info = normalize_inputs(payload, ctx)
+    records = parse_records(payload.get("records", []), ctx)
+
+    result: dict = {
+        "audit_id": info["audit_id"],
+        "zone": info["zone"],
+        "target": info["target"],
+        "salt": info["salt"],
+        "iterations": info["iterations"],
+        "algorithm": "SHA-1",
+        "opt_out": False,
+        "verdict": REJECT,
+        "ancestors": [],
+        "closest_encloser": None,
+        "next_closer": None,
+        "wildcard": None,
+        "records": [],
+        "checks": ctx.checks,
+        "errors": ctx.errors,
+        "frozen_at": None,
+    }
+
+    # 参数/记录本身有硬错误时，哈希复算已无意义，直接冻结拒绝结论。
+    if not info["zone"] or not info["target"] or ctx.errors:
+        result["records"] = [_record_public(r) for r in records]
+        return result
+
+    ev = evaluate_target(
+        info["target"], info["zone"], info["salt"], info["iterations"], records
+    )
+    # 单目标审计沿用统一的 ctx 收集检查项与错误
+    ctx.checks.extend(ev.checks)
+    ctx.errors.extend(ev.errors)
+    result["ancestors"] = ev.ancestors
+    result["closest_encloser"] = ev.closest_encloser
+    result["next_closer"] = ev.next_closer
+    result["wildcard"] = ev.wildcard
+    for r in records:
+        role = ev.roles.get(r.ref, {})
+        r.covers_closest_encloser = role.get("ce", False)
+        r.covers_nc = role.get("nc", False)
+        r.covers_wc = role.get("wc", False)
+        r.wrap = role.get("wrap", False)
+
+    check_interval_conflicts(records, ctx)
 
     result["records"] = [_record_public(r) for r in records]
     result["verdict"] = PASS if not ctx.errors else REJECT
     return result
 
 
-def _record_public(r: Record) -> dict:
+def _record_public(r: Record, roles: dict | None = None) -> dict:
+    roles = roles or {}
+    own = roles.get(r.ref, {})
     return {
         "ref": r.ref,
         "owner_hash": r.owner_hash,
         "next_hash": r.next_hash,
         "types": r.types,
         "opt_out": r.opt_out,
-        "wrap_direction": "wrap" if r.wrap else "no-wrap",
-        "covers_next_closer": r.covers_nc,
-        "covers_wildcard": r.covers_wc,
+        "wrap_direction": "wrap" if own.get("wrap", r.wrap) else "no-wrap",
+        "covers_next_closer": own.get("nc", r.covers_nc),
+        "covers_wildcard": own.get("wc", r.covers_wc),
+        "covers_closest_encloser": own.get("ce", False),
     }
+
+
+def record_public(r: Record, roles: dict | None = None) -> dict:
+    return _record_public(r, roles)
 
 
 def payload_fingerprint(result: dict) -> str:

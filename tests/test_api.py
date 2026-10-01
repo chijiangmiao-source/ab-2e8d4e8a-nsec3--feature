@@ -43,6 +43,7 @@ class ApiTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.httpd.server_close()
 
     def url(self, path):
         return f"http://127.0.0.1:{self.port}{path}"
