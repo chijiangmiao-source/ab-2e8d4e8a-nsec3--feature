@@ -8,6 +8,7 @@ import threading
 import time
 
 from .verifier import payload_fingerprint
+from .evidence import package_fingerprint
 
 
 class Store:
@@ -16,7 +17,7 @@ class Store:
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         if not os.path.exists(path):
-            self._write({"audits": {}, "counter": 0})
+            self._write({"audits": {}, "packages": {}, "counter": 0})
 
     def _read(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as fh:
@@ -35,6 +36,52 @@ class Store:
     def list_ids(self) -> list[str]:
         with self._lock:
             return sorted(self._read()["audits"].keys())
+
+    def get_package(self, package_id: str) -> dict | None:
+        with self._lock:
+            return self._read().get("packages", {}).get(package_id)
+
+    def list_package_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._read().get("packages", {}).keys())
+
+    def submit_package(self, doc: dict) -> tuple[dict, str]:
+        """冻结一次多目标共享证据包结论。
+
+        返回 (stored_record, status)，语义与 submit 相同：
+          frozen / unchanged / reuse（改换来源或目标 → 409，不覆盖原结论）。
+        """
+        with self._lock:
+            data = self._read()
+            packages = data.setdefault("packages", {})
+            package_id = doc["package_id"]
+            fp = package_fingerprint(doc)
+            existing = packages.get(package_id)
+            if existing is not None:
+                if existing["fingerprint"] != fp:
+                    conflict = {
+                        "package_id": package_id,
+                        "verdict": "rejected",
+                        "reuse": True,
+                        "message": (
+                            "证据包标识已被不同来源/目标使用：原冻结结论保持冻结，"
+                            f"原指纹 {existing['fingerprint'][:16]}…，本次指纹 {fp[:16]}…"
+                        ),
+                        "existing_frozen_at": existing.get("frozen_at"),
+                        "fingerprint": fp,
+                    }
+                    return conflict, "reuse"
+                return existing, "unchanged"
+            data["counter"] += 1
+            record = {
+                "fingerprint": fp,
+                "frozen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "seq": data["counter"],
+                "result": doc,
+            }
+            packages[package_id] = record
+            self._write(data)
+            return record, "frozen"
 
     def submit(self, result: dict) -> tuple[dict, str]:
         """冻结一次结论。

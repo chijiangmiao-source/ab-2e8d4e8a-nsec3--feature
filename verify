@@ -28,6 +28,7 @@ sys.path.insert(0, ROOT)
 
 from app.nsec3 import nsec3_hash  # noqa: E402
 from app.verifier import verify  # noqa: E402
+from app.evidence import build_package  # noqa: E402
 
 ZONE = "example.cn"
 SALT = "-"
@@ -72,6 +73,14 @@ DEFAULT_EXISTING = [
     "example.cn", "a.example.cn", "m.example.cn",
     "z.example.cn", "x.y.example.cn",
 ]
+
+# 多目标共享证据包验收固定目标：
+#   PKG_T_DEEP=p.x.y.example.cn  最优子集 {R3,R5}（CE=apex）
+#   PKG_T_XY  =g.x.y.example.cn  单独最优需 {R1,R5}（CE=x.y），但 R1 会使
+#                               PKG_T_DEEP 的 CE 下移、新 NC 失去覆盖
+PKG_T_DEEP = "p.x.y.example.cn"
+PKG_T_XY = "g.x.y.example.cn"
+PKG_XY_NAME = "x.y.example.cn"
 
 
 def codes(result):
@@ -153,6 +162,119 @@ def check_scenarios():
     expect(r["verdict"] == "rejected", "重复 owner 被拒绝", "重复 owner 未被拒绝")
 
 
+# ── 3b. 多目标共享证据包 ─────────────────────────────────────
+def check_packages():
+    step("3b", "多目标共享证据包：共享减少总数 / 加一条记录 CE 下移失效 / 拒绝面 / 原审计不变")
+    recs = build_chain(DEFAULT_EXISTING)
+    src = verify({"audit_id": "ACC-SRC", "zone": ZONE, "target": "q.example.cn",
+                  "salt": SALT, "iterations": ITER, "records": recs})
+    expect(src["verdict"] == "passed", "来源审计为已通过冻结结论",
+           f"来源审计未通过：{codes(src)}")
+    src["_fingerprint"] = "fp-acc-src"
+    src["_frozen_at"] = "2026-10-01T00:00:00Z"
+
+    doc = build_package("ACC-PKG", [PKG_T_DEEP, PKG_T_XY], src)
+    sel_refs = [x["ref"] for x in doc["selected_records"]]
+    expect(
+        doc["verdict"] == "passed" and len(sel_refs) == 2,
+        f"共同子集仅 {len(sel_refs)} 条记录且全部目标通过：{sel_refs}",
+        f"证据包异常：verdict={doc['verdict']} refs={sel_refs} errors={doc['errors']}",
+    )
+
+    # 各目标各自一条证明的“朴素拼接”并集
+    def minimal_refs(target):
+        import itertools
+        for k in range(1, len(recs) + 1):
+            for comb in itertools.combinations(range(len(recs)), k):
+                sub = [recs[i] for i in comb]
+                r = verify({"audit_id": "x", "zone": ZONE, "target": target,
+                            "salt": SALT, "iterations": ITER, "records": sub})
+                if r["verdict"] == "passed":
+                    return {f"R{i + 1}" for i in comb}
+        return set()
+
+    stitched = minimal_refs(PKG_T_DEEP) | minimal_refs(PKG_T_XY)
+    expect(
+        len(sel_refs) < len(stitched),
+        f"共享记录使总数减少：共同子集 {len(sel_refs)} 条 < 朴素拼接并集 {len(stitched)} 条 {sorted(stitched)}",
+        f"共享未减少总数：{sel_refs} vs {sorted(stitched)}",
+    )
+
+    # 增加一条记录（x.y 的 owner）即改变最近存在祖先而使候选失效
+    sub_recs = [recs[int(ref[1:]) - 1] for ref in sel_refs]
+    xy_rec = next(x for x in recs if x["owner_hash"] == nsec3_hash(PKG_XY_NAME, SALT, ITER))
+    before = verify({"audit_id": "x", "zone": ZONE, "target": PKG_T_DEEP,
+                     "salt": SALT, "iterations": ITER, "records": sub_recs})
+    after = verify({"audit_id": "x", "zone": ZONE, "target": PKG_T_DEEP,
+                    "salt": SALT, "iterations": ITER,
+                    "records": sub_recs + [xy_rec]})
+    expect(
+        before["verdict"] == "passed"
+        and before["closest_encloser"]["name"] == ZONE
+        and after["verdict"] == "rejected"
+        and after["closest_encloser"]["name"] == PKG_XY_NAME
+        and "NO_NEXT_CLOSER_COVERAGE" in codes(after),
+        "向候选子集加入 x.y owner 记录后 CE 下移、新 NC 失覆盖而候选失效",
+        f"加记录失效场景异常：before={before['verdict']}/"
+        f"{before['closest_encloser'] and before['closest_encloser']['name']}, "
+        f"after={after['verdict']}/{after['closest_encloser'] and after['closest_encloser']['name']}",
+    )
+
+    # 逐目标三项角色齐备，且直接复核与证据包结论一致
+    role_ok = all(
+        te["verdict"] == "passed" and te["closest_encloser"]["record_ref"]
+        and te["next_closer"]["covered_by"] and te["wildcard"]["covered_by"]
+        for te in doc["target_evidence"]
+    )
+    expect(role_ok and len(doc["target_evidence"]) == 2,
+           "并列展示每个目标的 CE/NC/通配符三项证明角色",
+           "证据包目标角色不完整")
+    recheck = verify({"audit_id": "x", "zone": ZONE, "target": PKG_T_DEEP,
+                      "salt": SALT, "iterations": ITER,
+                      "records": [{
+                          "owner_hash": x["owner_hash"],
+                          "next_hash": x["next_hash"],
+                          "types": x["types"],
+                      } for x in doc["selected_records"]]})
+    expect(recheck["verdict"] == "passed",
+           "用抽取子集直接复核目标仍通过（重算而非拼接宣称）",
+           f"子集复核未通过：{codes(recheck)}")
+
+    # 未选用记录与共享归属完整
+    expect(
+        len(doc["selected_records"]) + len(doc["unselected_records"])
+        == len(recs),
+        "并列展示未被选用记录，完整记录组仍冻结封存",
+        "选用+未选用记录数与冻结完整记录组不符",
+    )
+    expect(all(a["shared_by"] == 2 for a in doc["record_attribution"]),
+           "共享记录归属标注服务目标数", "共享归属标注异常")
+
+    # 拒绝面：非通过来源、重复目标、越区、改换来源/目标指纹
+    bad_src = verify({"audit_id": "ACC-BAD", "zone": ZONE, "target": "q.example.cn",
+                      "salt": SALT, "iterations": ITER, "records": []})
+    d = build_package("ACC-PKG-X", [PKG_T_DEEP, PKG_T_XY], bad_src)
+    expect(d["verdict"] == "rejected" and "SOURCE_NOT_PASSED" in codes(d),
+           "来源非通过结论明确拒绝", "非通过来源未被拒绝")
+    d = build_package("ACC-PKG-X", [PKG_T_DEEP, PKG_T_DEEP], src)
+    expect("DUP_TARGET" in codes(d), "重复目标明确拒绝", "重复目标未被拒绝")
+    d = build_package("ACC-PKG-X", [PKG_T_DEEP, "x.other.net"], src)
+    expect("OUT_OF_ZONE" in codes(d), "目标越区明确拒绝", "越区目标未被拒绝")
+
+    # 既有单目标审计读取与复核保持原结果（不改写原审计）
+    src_again = verify({"audit_id": "ACC-SRC", "zone": ZONE, "target": "q.example.cn",
+                        "salt": SALT, "iterations": ITER, "records": recs})
+    expect(
+        src_again["verdict"] == src["verdict"] == "passed"
+        and src_again["closest_encloser"]["hash"] == src["closest_encloser"]["hash"]
+        and src_again["next_closer"]["hash"] == src["next_closer"]["hash"]
+        and src_again["wildcard"]["hash"] == src["wildcard"]["hash"]
+        and len(src["records"]) == len(recs),
+        "既有单目标审计复核结果与原结论一致，原审计记录组未被改写",
+        "既有单目标审计复核结果发生变化或原审计被改写",
+    )
+
+
 # ── 4/5. HTTP 冒烟 ───────────────────────────────────────────
 def http(method, url, payload=None, timeout=6):
     data = None
@@ -176,8 +298,9 @@ def smoke(base_url, label):
            f"{label} 健康地址异常 status={status}")
 
     status, body = http("GET", base_url + "/")
-    expect(status == 200 and "最近存在祖先" in body and "环绕方向" in body,
-           f"{label} 审计页面可访问且含并列证据栏",
+    expect(status == 200 and "最近存在祖先" in body and "环绕方向" in body
+           and "多目标共享证据包" in body and "共享记录归属" in body,
+           f"{label} 审计页面可访问且含单目标并列证据栏与证据包区",
            f"{label} 审计页面异常 status={status}")
 
     recs = build_chain(DEFAULT_EXISTING)
@@ -208,6 +331,57 @@ def smoke(base_url, label):
     expect(status == 409 and json.loads(body).get("reuse") is True,
            f"{label} 标识复用但载荷改变返回 409 冲突",
            f"{label} 标识复用未被拦截 status={status}")
+
+    # ── 多目标共享证据包 HTTP 冒烟 ──
+    pkg = {"package_id": f"PKG-{label}", "source_audit_id": f"HTTP-{label}",
+           "targets": [PKG_T_DEEP, PKG_T_XY]}
+    status, body = http("POST", base_url + "/api/packages", pkg)
+    bj = json.loads(body)
+    expect(
+        status == 200 and bj["result"]["verdict"] == "passed"
+        and len(bj["result"]["selected_records"]) == 2,
+        f"{label} 证据包抽取冻结成功且共同子集为 2 条",
+        f"{label} 证据包抽取异常 status={status} body={body[:200]}",
+    )
+
+    status, body = http("GET", base_url + f"/api/packages?id=PKG-{label}")
+    bj = json.loads(body)
+    expect(status == 200 and bj["found"]
+           and bj["result"]["targets"] == [PKG_T_DEEP, PKG_T_XY]
+           and len(bj["result"]["target_evidence"]) == 2,
+           f"{label} 按包标识重新打开冻结结论成功",
+           f"{label} 证据包重开异常 status={status}")
+
+    # 包标识改换目标 → 409，且原冻结结论不变
+    pkg2 = dict(pkg, targets=[PKG_T_DEEP, "k.example.cn"])
+    status, body = http("POST", base_url + "/api/packages", pkg2)
+    expect(status == 409 and json.loads(body).get("reuse") is True,
+           f"{label} 证据包标识改换来源/目标返回 409",
+           f"{label} 证据包复用未被拦截 status={status}")
+
+    # 非通过来源、重复/越区目标 → 422
+    bad_src = dict(good, audit_id=f"HTTP-{label}-SRCB",
+                   records=[x for x in recs
+                            if x["owner_hash"] != nsec3_hash("m.example.cn", SALT, ITER)])
+    http("POST", base_url + "/api/audits", bad_src)
+    pkg3 = {"package_id": f"PKG-{label}-BADSRC",
+            "source_audit_id": f"HTTP-{label}-SRCB", "targets": [PKG_T_DEEP, PKG_T_XY]}
+    status, _ = http("POST", base_url + "/api/packages", pkg3)
+    expect(status == 422, f"{label} 非通过来源被拒绝(422)",
+           f"{label} 非通过来源未被拒绝 status={status}")
+    pkg4 = {"package_id": f"PKG-{label}-DUP", "source_audit_id": f"HTTP-{label}",
+            "targets": [PKG_T_DEEP, PKG_T_DEEP]}
+    status, _ = http("POST", base_url + "/api/packages", pkg4)
+    expect(status == 422, f"{label} 重复目标被拒绝(422)",
+           f"{label} 重复目标未被拒绝 status={status}")
+
+    # 抽取证据包后，来源单目标审计读取仍保持原结果
+    status, body = http("GET", base_url + f"/api/audits?id=HTTP-{label}")
+    bj = json.loads(body)
+    expect(status == 200 and bj["result"]["target"] == "q.example.cn"
+           and bj["result"]["verdict"] == "passed",
+           f"{label} 证据包抽取后来源审计结论保持不变",
+           f"{label} 来源审计被改写 status={status}")
 
 
 def check_http():
@@ -245,6 +419,7 @@ def main():
     check_build()
     check_unittests()
     check_scenarios()
+    check_packages()
     check_http()
 
     print("\n" + "=" * 60)

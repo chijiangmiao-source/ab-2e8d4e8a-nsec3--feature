@@ -49,6 +49,14 @@
   .chk-ok { color:var(--ok); }
   .muted { color:#57606a; font-size:12px; }
   .frozen { font-size:12px; color:#57606a; margin-bottom:8px; }
+  .divider { border:none; border-top:2px solid #0b2a4a; margin:22px 0 6px; }
+  .targets textarea { min-height:64px; }
+  .rolecell { text-align:center; font-size:11px; }
+  .rolecell .yes { color:var(--ok); font-weight:700; }
+  .rolecell .no { color:#9aa4ae; }
+  .pill { display:inline-block; padding:0 7px; border-radius:10px; font-size:11px; font-weight:700; background:#ddf4ff; color:#0a3069; margin-left:6px; }
+  .unsel td { color:#8c959f; }
+  .srcbox { border:1px solid var(--line); border-radius:6px; background:#f6f8fa; padding:8px 11px; font:12px ui-monospace,Menlo,Consolas,monospace; margin:8px 0; }
 </style>
 </head>
 <body>
@@ -81,6 +89,26 @@
     <div style="display:flex;gap:8px">
       <input type="text" id="reopen_id" placeholder="输入已冻结的 audit_id">
       <button type="button" onclick="reopen()">读取</button>
+    </div>
+
+    <hr class="divider">
+    <h2>多目标共享证据包（从已通过的冻结审计抽取）</h2>
+    <p class="muted">打开一份<b>已通过</b>的冻结审计后，输入稳定证据包标识与 2~6 个同一区域的规范目标名称；
+      服务冻结来源区域/盐值/迭代次数/完整记录组，并对候选子集<b>逐目标重算</b>最近存在祖先、下一层与通配符覆盖，
+      取记录数最少、再按 owner 哈希序列裁决的共同子集。</p>
+    <label>稳定证据包标识 package_id</label>
+    <input type="text" id="pkg_id" placeholder="如 SAT-NSEC3-PKG-20261001-001">
+    <label>来源审计标识 source_audit_id（须已通过并冻结）</label>
+    <input type="text" id="pkg_source" placeholder="如 SAT-NSEC3-20260929-001">
+    <label class="targets">规范目标名称（2~6 个，每行一个或逗号分隔）</label>
+    <textarea id="pkg_targets" placeholder="p.x.y.example.cn&#10;g.x.y.example.cn"></textarea>
+    <div class="btns">
+      <button type="button" class="primary" onclick="submitPackage()">抽取并冻结证据包</button>
+    </div>
+    <h2 style="margin-top:16px">按包标识重开冻结结论</h2>
+    <div style="display:flex;gap:8px">
+      <input type="text" id="reopen_pkg" placeholder="输入已冻结的 package_id">
+      <button type="button" onclick="reopenPkg()">读取</button>
     </div>
     <p class="muted" id="rawlink"></p>
   </section>
@@ -137,6 +165,7 @@ async function submitAudit(){
   const data = await r.json();
   if(data.reuse){ renderReuse(data); return; }
   render(data.result, data);
+  fillSourceFromAudit(data.result);
 }
 
 async function reopen(){
@@ -258,6 +287,170 @@ function render(r, meta){
 }
 
 addRec(); addRec(); addRec();
+
+// ───────────── 多目标共享证据包 ─────────────
+const PKG_API = "/api/packages";
+function parseTargets(){
+  return document.getElementById("pkg_targets").value
+    .split(/[\n,，;；]+/).map(s=>s.trim()).filter(Boolean);
+}
+function fillSourceFromAudit(r){
+  if(r && r.verdict==="passed"){
+    document.getElementById("pkg_source").value = r.audit_id || "";
+  }
+}
+async function submitPackage(){
+  const payload = {
+    package_id: document.getElementById("pkg_id").value.trim(),
+    source_audit_id: document.getElementById("pkg_source").value.trim(),
+    targets: parseTargets(),
+  };
+  if(!payload.package_id){ alert("请输入证据包标识"); return; }
+  if(!payload.source_audit_id){ alert("请输入来源审计标识"); return; }
+  const r = await fetch(PKG_API,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+  const data = await r.json();
+  if(data.reuse){ renderPackageReuse(data); return; }
+  if(!data.result){
+    renderPackageError((data.errors&&data.errors[0]&&data.errors[0].message) || "请求被拒绝");
+    return;
+  }
+  renderPackage(data.result, data);
+}
+async function reopenPkg(){
+  const id = document.getElementById("reopen_pkg").value.trim();
+  if(!id){ alert("请输入证据包标识"); return; }
+  const r = await fetch(PKG_API+"?id="+encodeURIComponent(id));
+  const data = await r.json();
+  if(!data.found){ renderPackageError("未找到证据包标识 "+id+" 的冻结结论"); return; }
+  document.getElementById("pkg_id").value = data.result.package_id||"";
+  document.getElementById("pkg_source").value = data.result.source_audit_id||"";
+  document.getElementById("pkg_targets").value = (data.result.targets||[]).join("\n");
+  renderPackage(data.result, data);
+}
+
+function renderPackageReuse(d){
+  const box=document.getElementById("result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"多目标共享证据包 · 冻结结论"));
+  const b=el("div","banner rejected");
+  b.textContent="拒绝：证据包标识复用但改换了来源或目标 —— 原冻结结论保持不变";
+  box.appendChild(b);
+  box.appendChild(el("p",null,d.message||""));
+}
+function renderPackageError(msg){
+  const box=document.getElementById("result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"多目标共享证据包 · 冻结结论"));
+  box.appendChild(el("div","banner rejected",msg));
+}
+
+function renderPackage(r, meta){
+  const box=document.getElementById("result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"多目标共享证据包 · 冻结结论"));
+  if(meta){
+    const f=el("div","frozen");
+    const who = meta.status==="unchanged" ? "（同包标识同来源/目标：返回既有冻结结论）" :
+                meta.status==="frozen" ? "（已冻结）" : "（已冻结结论）";
+    f.textContent = `package_id=${r.package_id}  冻结时间=${meta.frozen_at||""}  指纹=${(meta.fingerprint||"").slice(0,24)}… ${who}`;
+    box.appendChild(f);
+  }
+  const src=el("div","srcbox");
+  src.textContent = `来源审计=${r.source_audit_id}（冻结于 ${r.source_frozen_at||"—"}）  zone=${r.zone}  salt=${r.salt}  iterations=${r.iterations}  alg=${r.algorithm}  · 完整记录组已冻结封存，原审计不被改写`;
+  box.appendChild(src);
+
+  const banner=el("div","banner "+r.verdict);
+  banner.textContent = r.verdict==="passed"
+    ? `通过：从冻结完整记录组 ${r.frozen_source_records?.length??0} 条中抽出 ${r.selected_records?.length??0} 条共同记录，所有目标仍同时通过`
+    : "拒绝：无法抽取使所有目标同时通过的共同记录子集";
+  box.appendChild(banner);
+
+  if((r.errors||[]).length){
+    const de=el("details"); de.open=true;
+    de.appendChild(el("summary",null("拒绝原因（"+r.errors.length+"）")));
+    r.errors.forEach(e=>de.appendChild(el("div","err","["+e.code+"] "+e.message)));
+    box.appendChild(de);
+    return;
+  }
+
+  // ── 并列：每个目标的三项证明角色 ──
+  box.appendChild(el("h3",null,"各目标三项证明角色（在候选子集上逐目标重算）"));
+  const ev=(r.target_evidence||[]);
+  const grid=el("div");
+  ev.forEach(te=>{
+    const card=el("div","kv"); card.style.marginBottom="10px";
+    card.appendChild(el("div","k","目标 "+te.target));
+    const line=el("div","v");
+    line.textContent=`① CE ${te.closest_encloser.name}（记录 ${te.closest_encloser.record_ref}）  ② NC ${te.next_closer.name} 由 ${te.next_closer.covered_by}（${te.next_closer.wrap_direction==="wrap"?"环绕":"非环绕"}）覆盖  ③ 通配符 ${te.wildcard.name} 由 ${te.wildcard.covered_by}（${te.wildcard.wrap_direction==="wrap"?"环绕":"非环绕"}）覆盖`;
+    card.appendChild(line);
+    box.appendChild(card);
+  });
+
+  // ── 选用记录 × 各目标角色归属矩阵（共享记录归属） ──
+  box.appendChild(el("h3",null,"共享记录归属矩阵（入选共同子集）"));
+  const t=el("table"); const thead=el("thead"); const trh=el("tr");
+  ["记录","owner 哈希","next 哈希","类型","环绕",...ev.map(x=>x.target)].forEach(h=>trh.appendChild(el("th",null,h)));
+  thead.appendChild(trh); t.appendChild(thead);
+  const tb=el("tbody");
+  (r.selected_records||[]).forEach(rec=>{
+    const tr=el("tr");
+    tr.appendChild(el("td",null,rec.ref));
+    tr.appendChild(el("td",null,rec.owner_hash));
+    tr.appendChild(el("td",null,rec.next_hash));
+    tr.appendChild(el("td",null,(rec.types||[]).join(" ")));
+    tr.appendChild(el("td",null,rec.wrap_direction==="wrap"?"wrap":"no-wrap"));
+    ev.forEach(te=>{
+      const d=el("td","rolecell");
+      const roles=[];
+      if(rec.ref===te.closest_encloser.record_ref) roles.push("CE owner");
+      if(rec.ref===te.next_closer.covered_by) roles.push("覆盖 NC");
+      if(rec.ref===te.wildcard.covered_by) roles.push("覆盖 *.CE");
+      if(roles.length){
+        const s=el("span","yes","✔ "+roles.join(" / "));
+        d.appendChild(s);
+      } else {
+        d.appendChild(el("span","no","—"));
+      }
+      tr.appendChild(d);
+    });
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb); box.appendChild(t);
+  const att=el("p","muted");
+  att.textContent = "共享计数：" + (r.record_attribution||[]).map(a=>`${a.ref} 服务 ${a.shared_by} 个目标`).join("；");
+  box.appendChild(att);
+
+  // ── 未被选用记录（冻结完整记录组的其余部分） ──
+  box.appendChild(el("h3",null,"未被选用的冻结记录（"+(r.unselected_records||[]).length+" 条，不参与子集但仍封存）"));
+  const tu=el("table"); const trhu=el("tr");
+  ["记录","owner 哈希","next 哈希","类型"].forEach(h=>trhu.appendChild(el("th",null,h)));
+  tu.appendChild(trhu);
+  (r.unselected_records||[]).forEach(rec=>{
+    const tr=el("tr","unsel");
+    tr.appendChild(el("td",null,rec.ref));
+    tr.appendChild(el("td",null,rec.owner_hash));
+    tr.appendChild(el("td",null,rec.next_hash));
+    tr.appendChild(el("td",null,(rec.types||[]).join(" ")));
+    tu.appendChild(tr);
+  });
+  box.appendChild(tu);
+
+  // ── 每目标祖先哈希复算（子集视角） ──
+  const da=el("details"); da.appendChild(el("summary",null("各目标在共同子集上的祖先哈希复算")));
+  ev.forEach(te=>{
+    da.appendChild(el("div","k","目标 "+te.target));
+    const ta=el("table"); const tra=el("tr");
+    ["祖先名称","NSEC3 哈希","owner 是否在子集中"].forEach(h=>tra.appendChild(el("th",null,h)));
+    ta.appendChild(tra);
+    (te.ancestors||[]).forEach(a=>{
+      const tr=el("tr");
+      tr.appendChild(el("td",null,a.name));
+      tr.appendChild(el("td",null,a.hash));
+      tr.appendChild(el("td",a.owner_exists_in_subset?"ok":"no",
+        a.owner_exists_in_subset?("存在（"+(a.owner_record_ref||"")+"）"):"缺失"));
+      ta.appendChild(tr);
+    });
+    da.appendChild(ta);
+  });
+  box.appendChild(da);
+}
 </script>
 </body>
 </html>
