@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSEC3 NXDOMAIN 离线证明审计台</title>
+<style>
+  :root { --ok:#1a7f37; --bad:#c0392b; --line:#d0d7de; --bg:#f6f8fa; --ink:#1f2328; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:#0b2a4a; color:#fff; padding:14px 22px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; font-size:12px; opacity:.8; }
+  main { max-width:1280px; margin:18px auto; padding:0 16px; display:grid; grid-template-columns:430px 1fr; gap:16px; }
+  @media (max-width:1000px){ main{grid-template-columns:1fr;} }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:15px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+  label { display:block; font-size:12px; font-weight:600; margin:10px 0 3px; }
+  input[type=text], input[type=number], textarea { width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:5px; font:13px ui-monospace,Menlo,Consolas,monospace; }
+  textarea { resize:vertical; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .rec { border:1px dashed var(--line); border-radius:6px; padding:8px 10px; margin-top:8px; background:#fafbfc; }
+  .rec .rhead { display:flex; justify-content:space-between; align-items:center; font-size:12px; font-weight:700; }
+  button { cursor:pointer; border:1px solid var(--line); background:#fff; border-radius:5px; padding:7px 14px; font-size:13px; font-weight:600; }
+  button.primary { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  button.danger { color:var(--bad); }
+  .btns { margin-top:14px; display:flex; gap:10px; flex-wrap:wrap; }
+  .banner { padding:10px 14px; border-radius:6px; font-weight:700; margin-bottom:12px; }
+  .banner.passed { background:#e6f4ea; color:var(--ok); border:1px solid var(--ok); }
+  .banner.rejected { background:#fdecea; color:var(--bad); border:1px solid var(--bad); }
+  .grid4 { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:12px; }
+  .kv { border:1px solid var(--line); border-radius:6px; padding:9px 11px; background:#fafbfc; }
+  .kv .k { font-size:11px; color:#57606a; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  .kv .v { font:12px ui-monospace,Menlo,Consolas,monospace; word-break:break-all; margin-top:2px; }
+  table { width:100%; border-collapse:collapse; font:12px ui-monospace,Menlo,Consolas,monospace; }
+  th,td { border:1px solid var(--line); padding:5px 7px; text-align:left; vertical-align:top; word-break:break-all; }
+  th { background:#f0f3f6; }
+  td.ok, .tag-ok { color:var(--ok); font-weight:700; }
+  td.no, .tag-no { color:var(--bad); font-weight:700; }
+  .tag { display:inline-block; padding:0 6px; border-radius:4px; font-size:11px; }
+  .tag.wrap { background:#fff3cd; }
+  .tag.nowrap { background:#e2e3e5; }
+  details { margin-top:10px; }
+  summary { cursor:pointer; font-weight:600; font-size:13px; }
+  .err { color:var(--bad); font-size:12px; margin:2px 0; }
+  .chk-ok::before { content:"✔ "; color:var(--ok); }
+  .chk-no::before { content:"✘ "; color:var(--bad); }
+  .chk-no { color:var(--bad); }
+  .chk-ok { color:var(--ok); }
+  .muted { color:#57606a; font-size:12px; }
+  .frozen { font-size:12px; color:#57606a; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NSEC3 NXDOMAIN 离线证明审计台（仅 SHA-1 · 无 Opt-Out）</h1>
+  <p>精确复算迭代哈希 → 锁定最近存在祖先 → 校验下一层名称与通配符名在环形半开区间内的归属与环绕方向</p>
+</header>
+<main>
+  <section class="card">
+    <h2>提交审计</h2>
+    <label>稳定审计标识 audit_id</label>
+    <input type="text" id="audit_id" placeholder="如 SAT-NSEC3-20260929-001">
+    <label>规范域名（区域）zone</label>
+    <input type="text" id="zone" placeholder="example.cn">
+    <label>目标名称 target</label>
+    <input type="text" id="target" placeholder="host.offline.example.cn">
+    <div class="row2">
+      <div><label>NSEC3 盐值（- 或十六进制）</label><input type="text" id="salt" value="-"></div>
+      <div><label>迭代次数 iterations</label><input type="number" id="iterations" value="0" min="0" max="65535"></div>
+    </div>
+
+    <h2 style="margin-top:16px">NSEC3 记录组</h2>
+    <div id="recs"></div>
+    <div class="btns">
+      <button type="button" onclick="addRec()">＋ 添加记录</button>
+      <button type="button" class="primary" onclick="submitAudit()">冻结并审计</button>
+    </div>
+
+    <h2 style="margin-top:20px">按标识重开冻结结论</h2>
+    <div style="display:flex;gap:8px">
+      <input type="text" id="reopen_id" placeholder="输入已冻结的 audit_id">
+      <button type="button" onclick="reopen()">读取</button>
+    </div>
+    <p class="muted" id="rawlink"></p>
+  </section>
+
+  <section class="card" id="result">
+    <h2>审计结论与逐项证据</h2>
+    <p class="muted">提交后或按标识读取后，此处并列展示最近存在祖先、两项被覆盖名称、所用记录及环绕方向，供复算。</p>
+  </section>
+</main>
+
+<script>
+const API = "/api/audits";
+function esc(s){ return String(s ?? ""); }
+function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e; }
+
+function addRec(o){
+  const box = document.getElementById("recs");
+  const div = el("div","rec");
+  const head = el("div","rhead");
+  head.appendChild(el("span",null,"NSEC3 记录"));
+  const del = el("button","danger","删除"); del.type="button"; del.onclick=()=>div.remove();
+  head.appendChild(del);
+  div.appendChild(head);
+  const l1=el("label",null,"owner 哈希（base32hex）"); const i1=el("input"); i1.type="text"; i1.placeholder="0p9m...";
+  const l2=el("label",null,"next 哈希（base32hex）"); const i2=el("input"); i2.type="text"; i2.placeholder="r8q3...";
+  const l3=el("label",null,"类型位图（空格/逗号分隔）"); const i3=el("input"); i3.type="text"; i3.placeholder="NS SOA RRSIG DNSKEY";
+  const l4=el("label",null,"Opt-Out 标志"); const i4=el("input"); i4.type="checkbox"; i4.style.width="auto";
+  i1.value = o?.owner_hash || ""; i2.value = o?.next_hash || "";
+  i3.value = Array.isArray(o?.types) ? o.types.join(" ") : (o?.bitmap || "");
+  i4.checked = !!(o && o.opt_out);
+  div.append(l1,i1,l2,i2,l3,i3,l4,i4);
+  box.appendChild(div);
+}
+
+function collect(){
+  const records = [...document.querySelectorAll("#recs .rec")].map(d=>{
+    const ins=d.querySelectorAll("input");
+    return {owner_hash:ins[0].value.trim(), next_hash:ins[1].value.trim(),
+            types:ins[2].value.trim(), opt_out:ins[3].checked};
+  });
+  return {
+    audit_id: document.getElementById("audit_id").value.trim(),
+    zone: document.getElementById("zone").value.trim(),
+    target: document.getElementById("target").value.trim(),
+    salt: document.getElementById("salt").value.trim(),
+    iterations: parseInt(document.getElementById("iterations").value||"0",10),
+    records
+  };
+}
+
+async function submitAudit(){
+  let p; try{ p=collect(); }catch(e){ alert(e); return; }
+  const r = await fetch(API,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(p)});
+  const data = await r.json();
+  if(data.reuse){ renderReuse(data); return; }
+  render(data.result, data);
+}
+
+async function reopen(){
+  const id = document.getElementById("reopen_id").value.trim();
+  if(!id){ alert("请输入审计标识"); return; }
+  const r = await fetch(API+"?id="+encodeURIComponent(id));
+  const data = await r.json();
+  if(!data.found){ renderError("未找到标识 "+id+" 的冻结结论"); return; }
+  fillForm(data.result);
+  render(data.result, data);
+}
+
+function fillForm(r){
+  if(!r) return;
+  document.getElementById("audit_id").value=r.audit_id||"";
+  document.getElementById("zone").value=r.zone||"";
+  document.getElementById("target").value=r.target||"";
+  document.getElementById("salt").value=r.salt||"-";
+  document.getElementById("iterations").value=r.iterations??0;
+  document.getElementById("recs").innerHTML="";
+  (r.records||[]).forEach(x=>addRec({owner_hash:x.raw_owner||x.owner_hash,next_hash:x.raw_next||x.next_hash,types:x.types,opt_out:x.opt_out}));
+}
+
+function renderReuse(d){
+  const box=document.getElementById("result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"审计结论与逐项证据"));
+  const b=el("div","banner rejected"); b.textContent="拒绝：审计标识复用但载荷改变 —— 原冻结结论保持不变，不给予通过";
+  box.appendChild(b);
+  box.appendChild(el("p",null,d.message||""));
+}
+function renderError(msg){
+  const box=document.getElementById("result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"审计结论与逐项证据"));
+  box.appendChild(el("div","banner rejected",msg));
+}
+
+function kv(title, name, hash, extra){
+  const d=el("div","kv");
+  d.appendChild(el("div","k",title));
+  if(name!==undefined) d.appendChild(el("div","v",name));
+  if(hash) d.appendChild(el("div","v",hash));
+  if(extra) d.appendChild(el("div","muted",extra));
+  return d;
+}
+
+function render(r, meta){
+  const box=document.getElementById("result"); box.innerHTML="";
+  box.appendChild(el("h2",null,"审计结论与逐项证据"));
+  if(meta){
+    const f=el("div","frozen");
+    const who = meta.status==="unchanged" ? "（同标识同载荷：返回既有冻结结论）" :
+                meta.status==="frozen" ? "（已冻结）" : "（已冻结结论）";
+    f.textContent = `audit_id=${r.audit_id}  冻结时间=${meta.frozen_at||""}  载荷指纹=${(meta.fingerprint||"").slice(0,24)}… ${who}`;
+    box.appendChild(f);
+  }
+  const banner=el("div","banner "+r.verdict);
+  banner.textContent = r.verdict==="passed" ? "通过：NXDOMAIN 不存在证明成立" : "拒绝：不得据此判定 NXDOMAIN";
+  box.appendChild(banner);
+
+  // 并列四项：CE + 下一层名称 + 通配符（+参数）
+  const g=el("div","grid4");
+  const ce=r.closest_encloser;
+  g.appendChild(kv("① 最近存在祖先 CE", ce?ce.name:"（未找到）", ce?ce.hash:"", ce?("佐证记录 "+ce.record_ref):""));
+  const nc=r.next_closer;
+  const ncRef=(r.records||[]).find(x=>x.covers_next_closer);
+  g.appendChild(kv("② 被覆盖名称：下一层 NC", nc?nc.name:"（不适用）", nc?nc.hash:"",
+      ncRef?("由 "+ncRef.ref+" 覆盖 · "+(ncRef.wrap_direction==="wrap"?"环绕":"非环绕")+"区间"):"（无覆盖记录）"));
+  const wc=r.wildcard;
+  const wcRef=(r.records||[]).find(x=>x.covers_wildcard);
+  g.appendChild(kv("③ 被覆盖名称：通配符 *.CE", wc?wc.name:"（不适用）", wc?wc.hash:"",
+      wcRef?("由 "+wcRef.ref+" 覆盖 · "+(wcRef.wrap_direction==="wrap"?"环绕":"非环绕")+"区间，通配符展开已排除"):"（无覆盖记录 → 无法排除通配符）"));
+  g.appendChild(kv("审计参数", `zone=${r.zone}`, `target=${r.target}`,
+      `salt=${r.salt} iter=${r.iterations} alg=${r.algorithm} opt_out=${r.opt_out}`));
+  box.appendChild(g);
+
+  // 记录组与覆盖标记
+  box.appendChild(el("h3",null,"所用 NSEC3 记录（环形半开区间 [owner, next) 判定）"));
+  const t=el("table"); const thead=el("thead"); const trh=el("tr");
+  ["记录","owner 哈希","next 哈希","类型位图","环绕方向","覆盖 NC","覆盖 *.CE"].forEach(h=>trh.appendChild(el("th",null,h)));
+  thead.appendChild(trh); t.appendChild(thead);
+  const tb=el("tbody");
+  (r.records||[]).forEach(x=>{
+    const tr=el("tr");
+    tr.appendChild(el("td",null,x.ref));
+    tr.appendChild(el("td",null,x.owner_hash||"（非法）"));
+    tr.appendChild(el("td",null,x.next_hash||"（非法）"));
+    tr.appendChild(el("td",null,(x.types||[]).join(" ")));
+    const w=el("td"); const tag=el("span","tag "+(x.wrap_direction==="wrap"?"wrap":"nowrap"));
+    tag.textContent=x.wrap_direction==="wrap"?"wrap 环绕":"no-wrap"; w.appendChild(tag); tr.appendChild(w);
+    tr.appendChild(el("td",x.covers_next_closer?"ok":"no",x.covers_next_closer?"是":"否"));
+    tr.appendChild(el("td",x.covers_wildcard?"ok":"no",x.covers_wildcard?"是":"否"));
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb); box.appendChild(t);
+
+  // 祖先哈希复算
+  const da=el("details"); da.open=true; da.appendChild(el("summary",null("目标及各祖先的迭代哈希复算")));
+  const ta=el("table"); const tra=el("tr"); ["祖先名称","NSEC3 哈希","owner 是否存在于记录组"].forEach(h=>tra.appendChild(el("th",null,h)));
+  ta.appendChild(tra);
+  (r.ancestors||[]).forEach(a=>{
+    const tr=el("tr");
+    tr.appendChild(el("td",null,a.name));
+    tr.appendChild(el("td",null,a.hash));
+    tr.appendChild(el("td",a.owner_exists?"ok":"no",a.owner_exists?"存在（CE 候选）":"缺失"));
+    ta.appendChild(tr);
+  });
+  da.appendChild(ta); box.appendChild(da);
+
+  // 逐项检查
+  const dc=el("details"); dc.open=true; dc.appendChild(el("summary",null,"逐项检查"));
+  (r.checks||[]).forEach(c=>dc.appendChild(el("div",c.ok?"chk-ok":"chk-no",c.name+"："+c.detail)));
+  box.appendChild(dc);
+
+  if((r.errors||[]).length){
+    const de=el("details"); de.open=true; de.appendChild(el("summary",null,"拒绝原因 / 证据缺陷（"+r.errors.length+"）"));
+    r.errors.forEach(e=>de.appendChild(el("div","err","["+e.code+"] "+e.message)));
+    box.appendChild(de);
+  }
+}
+
+addRec(); addRec(); addRec();
+</script>
+</body>
+</html>

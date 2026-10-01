@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""一次性验收脚本（acceptance service）。
+
+依次穿插执行：
+  1. 构建检查：所有源码字节码编译；
+  2. 代码测试：unittest 全套；
+  3. 核心场景验收：合法不存在证明通过、环绕覆盖通过、
+     遗漏通配符覆盖被拒绝、非法记录被拒绝；
+  4. API/HTTP 冒烟：就地拉起服务，校验健康地址、审计页面、
+     提交冻结、按标识重开、标识复用冲突；
+  5. 若设置 BASE_URL（Compose 中指向 web 服务），追加远端 HTTP 冒烟。
+
+全部通过以 0 退出，任一失败以非零退出码报告。
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+from app.nsec3 import nsec3_hash  # noqa: E402
+from app.verifier import verify  # noqa: E402
+
+ZONE = "example.cn"
+SALT = "-"
+ITER = 0
+
+GREEN = "\033[32m"; RED = "\033[31m"; BOLD = "\033[1m"; RESET = "\033[0m"
+_failures = []
+
+
+def step(no, title):
+    print(f"\n{BOLD}── [{no}] {title}{RESET}", flush=True)
+
+
+def ok(msg):
+    print(f"{GREEN}  ✔ {msg}{RESET}", flush=True)
+
+
+def bad(msg):
+    print(f"{RED}  ✘ {msg}{RESET}", flush=True)
+    _failures.append(msg)
+
+
+def expect(cond, good, failmsg):
+    (ok if cond else bad)(good if cond else failmsg)
+    return cond
+
+
+def build_chain(existing, zone=ZONE, salt=SALT, iter_=ITER):
+    ordered = sorted(existing, key=lambda n: int(nsec3_hash(n, salt, iter_), 32))
+    hashes = [nsec3_hash(n, salt, iter_) for n in ordered]
+    recs = []
+    for i, (name, h) in enumerate(zip(ordered, hashes)):
+        recs.append({
+            "owner_hash": h,
+            "next_hash": hashes[(i + 1) % len(hashes)],
+            "types": ["NS", "SOA", "RRSIG"] if name == zone else ["A", "RRSIG"],
+        })
+    return recs
+
+
+DEFAULT_EXISTING = [
+    "example.cn", "a.example.cn", "m.example.cn",
+    "z.example.cn", "x.y.example.cn",
+]
+
+
+def codes(result):
+    return {e["code"] for e in result["errors"]}
+
+
+# ── 1. 构建检查 ──────────────────────────────────────────────
+def check_build():
+    step(1, "构建检查：字节码编译 app/ 与 tests/")
+    proc = subprocess.run(
+        [sys.executable, "-m", "compileall", "-q", "app", "tests"],
+        cwd=ROOT,
+    )
+    expect(proc.returncode == 0, "全部模块编译通过", "存在编译失败的模块")
+
+
+# ── 2. 代码测试 ──────────────────────────────────────────────
+def check_unittests():
+    step(2, "代码测试：unittest 全套")
+    proc = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        cwd=ROOT,
+    )
+    expect(proc.returncode == 0, "单元/集成/API 测试全部通过", "单元测试存在失败")
+
+
+# ── 3. 核心验收场景 ──────────────────────────────────────────
+def check_scenarios():
+    step(3, "核心场景：合法证明 / 环绕覆盖 / 遗漏通配符 / 非法记录")
+    recs = build_chain(DEFAULT_EXISTING)
+
+    r = verify({"audit_id": "ACC-1", "zone": ZONE, "target": "q.example.cn",
+                "salt": SALT, "iterations": ITER, "records": recs})
+    expect(
+        r["verdict"] == "passed",
+        "合法 NXDOMAIN 证明（单层缺失，NC+通配符均被覆盖）通过",
+        f"合法证明被错误拒绝：{codes(r)}",
+    )
+
+    r = verify({"audit_id": "ACC-2", "zone": ZONE, "target": "p.x.y.example.cn",
+                "salt": SALT, "iterations": ITER, "records": recs})
+    wrap = [x for x in r["records"]
+            if x["covers_wildcard"] and x["wrap_direction"] == "wrap"]
+    expect(
+        r["verdict"] == "passed" and wrap,
+        "环绕区间覆盖通配符的证明通过，并标记 wrap 方向",
+        f"环绕覆盖证明异常：verdict={r['verdict']}, wrap={wrap}",
+    )
+
+    r3 = next(x for x in recs
+              if x["owner_hash"] == nsec3_hash("m.example.cn", SALT, ITER))
+    truncated = [x for x in recs if x is not r3]
+    r = verify({"audit_id": "ACC-3", "zone": ZONE, "target": "q.example.cn",
+                "salt": SALT, "iterations": ITER, "records": truncated})
+    expect(
+        r["verdict"] == "rejected" and "NO_WILDCARD_COVERAGE" in codes(r),
+        "遗漏通配符覆盖的截断证据被拒绝",
+        f"遗漏通配符覆盖未被拒绝：verdict={r['verdict']}",
+    )
+
+    illegal = [dict(recs[0], owner_hash="wxyz!not-base32hex")] + recs[1:]
+    r = verify({"audit_id": "ACC-4", "zone": ZONE, "target": "q.example.cn",
+                "salt": SALT, "iterations": ITER, "records": illegal})
+    expect(
+        r["verdict"] == "rejected" and "BAD_OWNER_HASH" in codes(r),
+        "含非法 Base32hex owner 的记录被拒绝",
+        f"非法记录未被拒绝：verdict={r['verdict']}",
+    )
+
+    # 附加关键拒绝面：Opt-Out、重复 owner、标识/载荷校验
+    optout = [dict(recs[0], opt_out=True)] + recs[1:]
+    r = verify({"audit_id": "ACC-5", "zone": ZONE, "target": "q.example.cn",
+                "salt": SALT, "iterations": ITER, "records": optout})
+    expect(r["verdict"] == "rejected", "Opt-Out 记录被拒绝", "Opt-Out 未被拒绝")
+
+    dup = [dict(recs[0])] + recs
+    r = verify({"audit_id": "ACC-6", "zone": ZONE, "target": "q.example.cn",
+                "salt": SALT, "iterations": ITER, "records": dup})
+    expect(r["verdict"] == "rejected", "重复 owner 被拒绝", "重复 owner 未被拒绝")
+
+
+# ── 4/5. HTTP 冒烟 ───────────────────────────────────────────
+def http(method, url, payload=None, timeout=6):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()
+
+
+def smoke(base_url, label):
+    step("4/5", f"API/HTTP 冒烟（{label}：{base_url}）")
+    status, body = http("GET", base_url + "/healthz")
+    expect(status == 200 and '"ok"' in body,
+           f"{label} 健康地址 /healthz 可访问",
+           f"{label} 健康地址异常 status={status}")
+
+    status, body = http("GET", base_url + "/")
+    expect(status == 200 and "最近存在祖先" in body and "环绕方向" in body,
+           f"{label} 审计页面可访问且含并列证据栏",
+           f"{label} 审计页面异常 status={status}")
+
+    recs = build_chain(DEFAULT_EXISTING)
+    good = {"audit_id": f"HTTP-{label}", "zone": ZONE, "target": "q.example.cn",
+            "salt": SALT, "iterations": ITER, "records": recs}
+    status, body = http("POST", base_url + "/api/audits", good)
+    expect(status == 200 and json.loads(body)["result"]["verdict"] == "passed",
+           f"{label} 合法证明 POST 冻结成功",
+           f"{label} 合法证明提交异常 status={status} body={body[:200]}")
+
+    status, body = http("GET", base_url + f"/api/audits?id=HTTP-{label}")
+    bj = json.loads(body)
+    expect(status == 200 and bj["found"]
+           and bj["result"]["closest_encloser"]["name"] == ZONE,
+           f"{label} 按审计标识重新打开冻结结论成功",
+           f"{label} 重开冻结结论异常 status={status}")
+
+    truncated = [x for x in recs
+                 if x["owner_hash"] != nsec3_hash("m.example.cn", SALT, ITER)]
+    badp = dict(good, audit_id=f"HTTP-{label}-BAD", records=truncated)
+    status, body = http("POST", base_url + "/api/audits", badp)
+    expect(status == 422 and json.loads(body)["result"]["verdict"] == "rejected",
+           f"{label} 遗漏通配符覆盖经 HTTP 被拒绝(422)",
+           f"{label} 缺陷证据未被 HTTP 拒绝 status={status}")
+
+    reuse = dict(good, target="zzz.example.cn")
+    status, body = http("POST", base_url + "/api/audits", reuse)
+    expect(status == 409 and json.loads(body).get("reuse") is True,
+           f"{label} 标识复用但载荷改变返回 409 冲突",
+           f"{label} 标识复用未被拦截 status={status}")
+
+
+def check_http():
+    # 就地拉起一个临时服务做冒烟（自包含，无需外部依赖）
+    os.environ.setdefault("AUDIT_DB", os.path.join(tempfile.mkdtemp(), "a.json"))
+    from app.server import build_server
+    httpd = build_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    time.sleep(0.2)
+    try:
+        smoke(f"http://127.0.0.1:{port}", "inproc")
+    finally:
+        httpd.shutdown()
+
+    base_url = os.environ.get("BASE_URL")
+    if base_url:
+        # Compose 下等待 web 就绪后做远端冒烟
+        for _ in range(30):
+            try:
+                status, _ = http("GET", base_url + "/healthz", timeout=2)
+                if status == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        smoke(base_url.rstrip("/"), "compose-web")
+    else:
+        print("\n  （未设置 BASE_URL，跳过远端 Compose web 冒烟）")
+
+
+def main():
+    print(BOLD + "NSEC3 NXDOMAIN 审计服务 —— 一次性验收" + RESET, flush=True)
+    check_build()
+    check_unittests()
+    check_scenarios()
+    check_http()
+
+    print("\n" + "=" * 60)
+    if _failures:
+        print(f"{RED}{BOLD}验收失败：{len(_failures)} 项未通过{RESET}")
+        for f in _failures:
+            print(f"{RED}  - {f}{RESET}")
+        sys.exit(1)
+    print(f"{GREEN}{BOLD}验收通过：构建、测试、核心场景、API/HTTP 冒烟全部成功{RESET}")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
